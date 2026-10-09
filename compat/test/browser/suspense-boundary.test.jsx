@@ -22,13 +22,14 @@ const h = React.createElement;
  *
  * The fix gives `_childDidSuspend` a unique mangled name (`__D`).
  *
- * This test uses a component with `_id` (mangled to `__c`) between the
- * Suspense boundary and the thrower. In MINIFY mode:
- * - On main: the hook mistakes the fake for a Suspense boundary (false
- *   positive on `__c`), the promise is delivered to the wrong component,
- *   and the test fails.
- * - With the fix: the hook checks for `__D`, skips the fake, finds the
- *   real Suspense boundary, and the test passes.
+ * This file contains two collision regression tests, run with MINIFY=true:
+ * - `_id` (a string → `__c`): on main, the hook tries to call the string
+ *   as the suspend handler, throwing `TypeError: i.__c is not a function`.
+ * - `_cleanup` (a no-op function → `__c`): on main, the hook calls the
+ *   no-op, silently swallowing the promise. The real Suspense boundary
+ *   never retries, reproducing the original blank-page symptom.
+ * With the fix (`_childDidSuspend` → `__D`), the hook correctly skips
+ * both fakes and finds the real Suspense boundary.
  *
  * In source mode the test passes on both (no collision in source), but
  * documents the expected behavior.
@@ -80,6 +81,55 @@ describe('suspense boundary detection', () => {
 
 		// The real Suspense boundary must catch the promise, not the fake.
 		// On main (MINIFY), the promise goes to FakeBoundary and this fails.
+		expect(scratch.innerHTML).to.contain('loading...');
+
+		return resolve('hello').then(() => {
+			rerender();
+			expect(scratch.innerHTML).to.contain('data: hello');
+			expect(scratch.innerHTML).to.not.contain('loading...');
+		});
+	});
+
+	it('should not silently swallow promise when colliding property is a function', () => {
+		const [useLoader, resolve] = createSuspenseLoader();
+
+		function Loader() {
+			const data = useLoader();
+			return <div>data: {data}</div>;
+		}
+
+		// This component has `_cleanup` as a no-op function, which
+		// mangle.json maps to `__c`. On main's built output, the _catchError
+		// hook mistakes it for a Suspense boundary and calls it with the
+		// promise. Since it's a no-op, the promise is silently swallowed —
+		// the real Suspense boundary never retries, reproducing the
+		// original blank-page symptom from the agents app.
+		class SilentSwallower extends Component {
+			constructor(props) {
+				super(props);
+				// _cleanup -> __c in built output (collides on main).
+				// A no-op function, like the shadowing component in the
+				// original failure which didn't throw but mishandled it.
+				this._cleanup = () => {};
+			}
+			render() {
+				return <div class="swallower">{this.props.children}</div>;
+			}
+		}
+
+		render(
+			<Suspense fallback={<div>loading...</div>}>
+				<SilentSwallower>
+					<Loader />
+				</SilentSwallower>
+			</Suspense>,
+			scratch
+		);
+		rerender();
+
+		// The real Suspense boundary must catch the promise.
+		// On main (MINIFY), the promise is swallowed and the fallback
+		// never appears (or the content never resolves).
 		expect(scratch.innerHTML).to.contain('loading...');
 
 		return resolve('hello').then(() => {
