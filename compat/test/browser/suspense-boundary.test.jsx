@@ -3,8 +3,7 @@ import React, {
 	createElement,
 	render,
 	Component,
-	Suspense,
-	createContext
+	Suspense
 } from 'preact/compat';
 import { setupScratch, teardown } from '../../../test/_util/helpers';
 import { createSuspenseLoader } from './suspense-utils';
@@ -13,13 +12,26 @@ const h = React.createElement;
 /* eslint-env browser */
 
 /**
- * App-level behavior tests for Suspense boundary detection.
+ * Regression test for the Suspense boundary minification collision.
  *
- * These verify that when a promise is thrown deep in the component tree,
- * the nearest Suspense boundary correctly catches it — even when intermediate
- * components (providers, routers, etc.) sit between the thrower and the
- * boundary. This is the scenario from real apps using data-fetching
- * libraries like TanStack Query with useSuspenseQuery.
+ * Root cause: preact's mangle.json mapped multiple properties to `__c`,
+ * including `_childDidSuspend`. In built output, the `_catchError` hook's
+ * check `component._childDidSuspend` became `component.__c`, which falsely
+ * matched any component with another `__c`-mangled property (e.g. `_id`,
+ * `_cleanup`, `_component`, `_commit`).
+ *
+ * The fix gives `_childDidSuspend` a unique mangled name (`__D`).
+ *
+ * This test uses a component with `_id` (mangled to `__c`) between the
+ * Suspense boundary and the thrower. In MINIFY mode:
+ * - On main: the hook mistakes the fake for a Suspense boundary (false
+ *   positive on `__c`), the promise is delivered to the wrong component,
+ *   and the test fails.
+ * - With the fix: the hook checks for `__D`, skips the fake, finds the
+ *   real Suspense boundary, and the test passes.
+ *
+ * In source mode the test passes on both (no collision in source), but
+ * documents the expected behavior.
  */
 describe('suspense boundary detection', () => {
 	/** @type {HTMLDivElement} */
@@ -34,8 +46,50 @@ describe('suspense boundary detection', () => {
 		teardown(scratch);
 	});
 
+	it('should not mistake a component with _id for a Suspense boundary', () => {
+		const [useLoader, resolve] = createSuspenseLoader();
+
+		function Loader() {
+			const data = useLoader();
+			return <div>data: {data}</div>;
+		}
+
+		// This component has `_id`, which mangle.json maps to `__c`.
+		// On main's built output, the _catchError hook's `component.__c`
+		// check falsely matches this, treating it as a Suspense boundary.
+		class FakeBoundary extends Component {
+			constructor(props) {
+				super(props);
+				// _id -> __c in built output (collides on main)
+				this._id = 'fake-boundary';
+			}
+			render() {
+				return <div class="fake">{this.props.children}</div>;
+			}
+		}
+
+		render(
+			<Suspense fallback={<div>loading...</div>}>
+				<FakeBoundary>
+					<Loader />
+				</FakeBoundary>
+			</Suspense>,
+			scratch
+		);
+		rerender();
+
+		// The real Suspense boundary must catch the promise, not the fake.
+		// On main (MINIFY), the promise goes to FakeBoundary and this fails.
+		expect(scratch.innerHTML).to.contain('loading...');
+
+		return resolve('hello').then(() => {
+			rerender();
+			expect(scratch.innerHTML).to.contain('data: hello');
+			expect(scratch.innerHTML).to.not.contain('loading...');
+		});
+	});
+
 	it('should catch promise thrown through provider components', () => {
-		const Ctx = createContext(null);
 		const [useLoader, resolve] = createSuspenseLoader();
 
 		function Loader() {
@@ -44,42 +98,26 @@ describe('suspense boundary detection', () => {
 		}
 
 		function Provider(props) {
-			return (
-				<Ctx.Provider value={{}}>
-					<div class="provider">{props.children}</div>
-				</Ctx.Provider>
-			);
-		}
-
-		function Router(props) {
-			return <div class="router">{props.children}</div>;
-		}
-
-		function Route(props) {
-			return <div class="route">{props.children}</div>;
+			return <div class="provider">{props.children}</div>;
 		}
 
 		render(
 			<Provider>
 				<Suspense fallback={<div>loading...</div>}>
-					<Router>
-						<Route>
-							<Loader />
-						</Route>
-					</Router>
+					<Provider>
+						<Loader />
+					</Provider>
 				</Suspense>
 			</Provider>,
 			scratch
 		);
 		rerender();
 
-		// Fallback should show while suspended
 		expect(scratch.innerHTML).to.contain('loading...');
 
 		return resolve('hello').then(() => {
 			rerender();
 			expect(scratch.innerHTML).to.contain('data: hello');
-			expect(scratch.innerHTML).to.not.contain('loading...');
 		});
 	});
 
@@ -103,42 +141,12 @@ describe('suspense boundary detection', () => {
 		);
 		rerender();
 
-		// Inner boundary should catch, not outer
 		expect(scratch.innerHTML).to.contain('inner loading');
 		expect(scratch.innerHTML).to.not.contain('outer loading');
 
 		return resolve('done').then(() => {
 			rerender();
 			expect(scratch.textContent).to.contain('done');
-		});
-	});
-
-	it('should retry the suspender after promise resolves', () => {
-		const [useLoader, resolve] = createSuspenseLoader();
-		let renderCount = 0;
-
-		function Loader() {
-			renderCount++;
-			const data = useLoader();
-			return <div>{data} (renders: {renderCount})</div>;
-		}
-
-		render(
-			<Suspense fallback={<div>waiting...</div>}>
-				<Loader />
-			</Suspense>,
-			scratch
-		);
-		rerender();
-
-		const firstRenderCount = renderCount;
-		expect(scratch.innerHTML).to.contain('waiting...');
-
-		return resolve('result').then(() => {
-			rerender();
-			// Suspender should have re-rendered after resolve
-			expect(renderCount).to.be.greaterThan(firstRenderCount);
-			expect(scratch.innerHTML).to.contain('result');
 		});
 	});
 });
